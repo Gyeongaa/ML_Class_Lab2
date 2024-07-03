@@ -1,149 +1,129 @@
-import matplotlib.pyplot as plt
 import numpy as np
-import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms, datasets, models
-import torch
-from torchinfo import summary
-from PIL import Image
-from torchvision.transforms import ToTensor
-from glob import glob
-from torch.utils.data import Dataset, DataLoader
-from collections import defaultdict
-import torch.nn.functional as F
-from tqdm.auto import tqdm
-import segmentation_models_pytorch as smp
-import time
-import datetime
-from sklearn.metrics import roc_auc_score
-from sklearn.metrics import confusion_matrix
-from sklearn.metrics import f1_score
+import matplotlib.pyplot as plt
 import os
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-batch_size = 1
-image_count = 50
-img_size = 512
-tf = ToTensor()
+import pandas as pd
+from PIL import Image
+import warnings
+from sklearn.model_selection import KFold
+import tensorflow as tf
+import cv2
+from tensorflow.keras.preprocessing import image
+import efficientnet.tfkeras as efn
+from tensorflow.keras.applications.resnet50 import preprocess_input, decode_predictions
+from tensorflow.keras.models import *
+from tensorflow.keras.optimizers import *
+import numpy as np
+import tensorflow as tf
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+from tensorflow import keras
+import os
+import pandas as pd
+from PIL import Image
+import warnings
+from keras.layers import BatchNormalization,Add, MaxPooling3D, GlobalAveragePooling3D, Dense, Flatten,GlobalAveragePooling2D
+from tensorflow.python.keras.applications.resnet import ResNet152
+import tensorflow.keras as K
+from tensorflow.keras.callbacks import ReduceLROnPlateau, EarlyStopping
+from tensorflow.keras import datasets, layers, models, losses, Model
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.models import Model
+from tensorflow.keras import layers
+from tensorflow.keras.layers import *
+from tensorflow.keras.callbacks import *
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.regularizers import l2
+from tensorflow.keras.activations import relu,softmax
+from tensorflow.keras.models import Model
+from tensorflow.keras.losses import CategoricalCrossentropy
+from sklearn.model_selection import StratifiedKFold,KFold
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import MultiLabelBinarizer
+from tensorflow.keras.initializers import Zeros, Ones
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.metrics import precision_recall_fscore_support, roc_curve, auc
+from sklearn.metrics import roc_auc_score, confusion_matrix, accuracy_score
+from sklearn.metrics import plot_confusion_matrix
+from sklearn.metrics import classification_report
+import seaborn as sns
+from matplotlib import rcParams
+from tqdm import tqdm
+from glob import glob
+import datetime
+import time
+warnings.filterwarnings("ignore")
 
+print(os.getcwd())
+# os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ['CUDA_VISIBLE_DEVICES'] = "1"
 
-def expand2square(pil_img, background_color):
-    width, height = pil_img.size
-    if width == height:
-        return pil_img
-    elif width > height:
-        result = Image.new(pil_img.mode, (width, width), background_color)
-        result.paste(pil_img, (0, (width - height) // 2))
-        return result
-    else:
-        result = Image.new(pil_img.mode, (height, height), background_color)
-        result.paste(pil_img, ((height - width) // 2, 0))
-        return result
+def load_data(npy_path):
+    print('-'*30)
+    print('load images...')
+    print('-'*30)
+    
+    whole = np.zeros((len(npy_path), 512, 512, 3))
+    
+    for i in tqdm(range(len(npy_path))):
+        path = npy_path[i]
+        train_npy_path = path
+        imgs_tmp = np.array(Image.open(train_npy_path))
+        whole[i] = imgs_tmp
+        
+            
+    imgs_tmp = 0
+    print('-'*30)
+    print('imgs : {} '.format(whole.shape))     
+    print('-'*30)
+    imgs = whole.astype('float32')
+    print('img : ', imgs.max())
 
+    print('-'*30)
+    print('normalization start...')
+    print('-'*30)
+    
+    imgs = cv2.normalize(whole, None, 0, 1, cv2.NORM_MINMAX)
+   
+    print('img : ', imgs.max())
 
-class CustomDataset(Dataset):
-    def __init__(self, image_list, label_list, file_list):
-        self.img_path = image_list
-        self.label = label_list
-        self.file_list = file_list
+    return imgs
 
-    def __len__(self):
-        return len(self.label)
-
-    def __getitem__(self, idx):
-        image_tensor = self.img_path[idx]
-        label_tensor = self.label[idx]
-        path = os.path.splitext(os.path.basename(self.file_list[idx]))[0]
-        return image_tensor, label_tensor, path
-
-
-def data_load(image_list):
-    tumor_mask_list = [f.replace('/image/', '/polygon/TP_tumor/')
-                       for f in image_list]
-    normal_mask_list = [
-        f.replace('/image/', '/polygon/NT_normal/') for f in image_list]
-
-    image = torch.zeros((len(image_list), 3, img_size, img_size))
-    mask = torch.zeros((len(image_list), 3, img_size, img_size))
-
-    for i in tqdm(range(len(image_list))):
-        img = 1 - \
-            tf(np.array(expand2square(Image.open(
-                image_list[i]), (255, 255, 255)).resize((img_size, img_size))))
-        msk_tumor = np.array((expand2square(Image.open(
-            tumor_mask_list[i]), (0, 0, 0)).convert('L')).resize((img_size, img_size)))
-        msk_normal = np.array((expand2square(Image.open(
-            normal_mask_list[i]), (0, 0, 0)).convert('L')).resize((img_size, img_size)))
-        msk_back = np.where((msk_tumor+msk_normal) == 0, 255, 0)
-        image[i] = img
-        mask[i, 0] = tf(msk_back)
-        mask[i, 1] = tf(msk_tumor)
-        mask[i, 2] = tf(msk_normal)
-
-    dataset = CustomDataset(image, mask, image_list)
-    dataloader = DataLoader(dataset, batch_size=batch_size,
-                            shuffle=True, drop_last=True)
-    return dataloader
-
-
-def dice_loss(pred, target, num_classes=3):
-    smooth = 1.
-    dice_per_class = torch.zeros(num_classes).to(pred.device)
-
-    for class_id in range(num_classes):
-        pred_class = pred[:, class_id, ...]
-        target_class = target[:, class_id, ...]
-
-        intersection = torch.sum(pred_class * target_class)
-        A_sum = torch.sum(pred_class * pred_class)
-        B_sum = torch.sum(target_class * target_class)
-
-        dice_per_class[class_id] = 1 - \
-            (2. * intersection + smooth) / (A_sum + B_sum + smooth)
-
-    return dice_per_class
-
-
-def Predict(image_list):
+def main(model_path, test_csv_path):
+    ###### Model prediction 시작 ######
     start = time.time()
     d = datetime.datetime.now()
     now_time = f"{d.year}-{d.month}-{d.day} {d.hour}:{d.minute}:{d.second}"
-    print(f'[Predict Start]')
-    print(f'Predict Start Time : {now_time}')
-    print('Data load...')
-    dataloader = data_load(image_list)
-    model = smp.UnetPlusPlus(
-        'efficientnet-b6', in_channels=3, classes=3).to(device)
-    model.load_state_dict(torch.load('Best_model.pt'))
-    total_path = []
-    print('predict...')
-    total_prob = torch.zeros(
-        (len(dataloader), 3, img_size, img_size)).to(device)
-    total_y = torch.zeros((len(dataloader), 3, img_size, img_size)).to(device)
-    total_dice = torch.zeros((len(dataloader), 3)).to(device)
-    model.eval()
-    count = 0
-    val_running_loss = 0.0
-    acc_loss = 0
-    test = tqdm(dataloader)
+    print(f'[Model prediction Start]')
+    print(f'Model prediction Start Time : {now_time}')
 
-    with torch.no_grad():
-        for x, y, path in test:
-            y = y.to(device).float()
-            x = x.to(device).float()
-            predict = model(x).to(device)
-            cost = torch.mean(dice_loss(predict, y, num_classes=3))  # cost 구함
-            acc = 1-torch.mean(dice_loss(predict, y, num_classes=3))
-            val_running_loss += cost.item()
-            acc_loss += acc
-            prob_pred = predict
-            total_path.append(path)
-            total_prob[count] = predict.squeeze(dim=1)
-            total_y[count] = y.squeeze(dim=1)
-            total_dice[count] = dice_loss(predict, y, num_classes=3)
-            count += 1
+    model=load_model(model_path)
+    print(model.summary())
+
+    test = pd.read_csv(test_csv_path)
+    test_x = load_data(test.path)
+
+    test_y_before = test['class']
+    GT = np.array(test_y_before)
+
+    encoder = OneHotEncoder(sparse=False)
+    test_y = encoder.fit_transform(test_y_before.values.reshape(-1, 1))
+
+    predictions = model.predict(test_x, batch_size=30, verbose=1)
+    predicted_class = np.argmax(predictions, axis=1)
+    class_names = ['Normal', 'In situ', 'Malignant']
+
+    cm = confusion_matrix(GT, predicted_class)
+    print(cm)
+    cm_df = pd.DataFrame(cm)
+    cm_df.to_csv('./cm.csv', index=False)
+    print(classification_report(GT, predicted_class, target_names = class_names))
+
+    result_df = pd.DataFrame({'FileName': test['path'], 'GT': GT, 'Pred': predicted_class})
+    result_df.to_csv('./result.csv', index=False)
+
     end = time.time()
     d = datetime.datetime.now()
     now_time = f"{d.year}-{d.month}-{d.day} {d.hour}:{d.minute}:{d.second}"
-    print(f'Predict Time : {now_time}s Time taken : {end-start}')
-    print(f'[Predict End]')
-    return total_path, total_y.cpu(), total_prob.cpu(), total_dice.cpu()
+    print(f'Model prediction Time : {now_time}s Time taken : {end-start}')
+    print(f'[Model prediction End]')
+    ###### Model prediction 끝 ######
